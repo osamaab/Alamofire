@@ -24,6 +24,139 @@
 
 import Foundation
 
+struct IdentityAndTrust {
+  var identityRef: SecIdentity
+  var trust: SecTrust
+  var certificates: [SecCertificate]
+ }
+
+// Method to extract the identity, certificate chain and trust
+
+func extractIdentity(certData: NSData, certPassword: String) -> IdentityAndTrust? {
+  
+  var identityAndTrust: IdentityAndTrust?
+  var securityStatus: OSStatus = errSecSuccess
+  
+  var items: CFArray?
+  let certOptions: Dictionary = [kSecImportExportPassphrase as String : certPassword]
+  securityStatus = SecPKCS12Import(certData, certOptions as CFDictionary, &items)
+  if securityStatus == errSecSuccess {
+    let certificateItems: CFArray = items! as CFArray
+    let certItemsArray: Array = certificateItems as Array
+    let dict: AnyObject? = certItemsArray.first
+    
+    if let certificateDict: Dictionary = dict as? Dictionary<String, AnyObject> {
+      
+      // get the identity
+      let identityPointer: AnyObject? = certificateDict["identity"]
+      let secIdentityRef: SecIdentity = identityPointer as! SecIdentity
+      
+      // get the trust
+      let trustPointer: AnyObject? = certificateDict["trust"]
+      let trustRef: SecTrust = trustPointer as! SecTrust
+      
+      // get the certificate chain
+      var certRef: SecCertificate? // <- write on
+      SecIdentityCopyCertificate(secIdentityRef, &certRef)
+      var certificateArray = [SecCertificate]()
+      certificateArray.append(certRef! as SecCertificate)
+      
+      let count = SecTrustGetCertificateCount(trustRef)
+      if count > 1 {
+        for i in 1..<count {
+          if let cert = SecTrustGetCertificateAtIndex(trustRef, i) {
+            certificateArray.append(cert)
+          }
+        }
+      }
+      
+      identityAndTrust = IdentityAndTrust(identityRef: secIdentityRef, trust: trustRef, certificates: certificateArray)
+    }
+  }
+  
+  return identityAndTrust
+}
+
+
+public class PKCS12 {
+  var label:String?
+  var keyID:NSData?
+  var trust:SecTrust?
+  var certChain:[SecTrust]?
+  var identity:SecIdentity?
+
+  public init(PKCS12Data:NSData,password:String)
+  {
+    let importPasswordOption:NSDictionary = [kSecImportExportPassphrase as NSString:password]
+    var items : CFArray?
+    let secError:OSStatus = SecPKCS12Import(PKCS12Data, importPasswordOption, &items)
+    
+    guard secError == errSecSuccess else {
+      if secError == errSecAuthFailed {
+        NSLog("ERROR: SecPKCS12Import returned errSecAuthFailed. Incorrect password?")
+      }
+      fatalError("SecPKCS12Import returned an error trying to import PKCS12 data")
+    }
+    
+    guard let theItemsCFArray = items else { fatalError()  }
+    let theItemsNSArray:NSArray = theItemsCFArray as NSArray
+    guard let dictArray = theItemsNSArray as? [[String:AnyObject]] else { fatalError() }
+    
+    func f<T>(key:CFString) -> T? {
+      for d in dictArray {
+        if let v = d[key as String] as? T {
+          return v
+        }
+        if(key == kSecImportItemLabel || key == kSecImportItemKeyID){
+          var cert: SecCertificate?
+          if let cd = d["identity"]{
+            SecIdentityCopyCertificate(cd as! SecIdentity, &cert)
+            if let certData = cert{
+              if(key == kSecImportItemLabel){
+                let lblDer = SecCertificateCopySubjectSummary(certData)
+                if let lblVallue = lblDer {
+                  return lblVallue as? T
+                }
+              }
+              var key: SecKey?
+              SecIdentityCopyPrivateKey(cd as! SecIdentity, &key)
+              if let keyData = key{
+                let keyDict = SecKeyCopyAttributes(keyData)
+                if let keyDictUnwrapped = keyDict, let keyValue = (keyDictUnwrapped as NSDictionary)["v_Data"] as? NSData {
+                  return keyValue as? T
+                }
+              }
+              
+            }
+            
+          }
+          
+        }
+      }
+      return nil
+    }
+    self.label = f(key: kSecImportItemLabel)
+    self.keyID = f(key: kSecImportItemKeyID)
+    self.trust = f(key: kSecImportItemTrust)
+    self.certChain = f(key: kSecImportItemCertChain)
+    self.identity =  f(key: kSecImportItemIdentity)
+  }
+}
+
+extension URLCredential {
+  public convenience init?(PKCS12 thePKCS12:PKCS12) {
+    if let identity = thePKCS12.identity {
+      self.init(
+        identity: identity,
+        certificates: thePKCS12.certChain,
+        persistence: URLCredential.Persistence.forSession)
+    }
+    else { return nil }
+  }
+}
+
+
+
 /// Class which implements the various `URLSessionDelegate` methods to connect various Alamofire features.
 open class SessionDelegate: NSObject {
     private let fileManager: FileManager
@@ -70,6 +203,34 @@ protocol SessionStateProvider: AnyObject {
 // MARK: URLSessionDelegate
 
 extension SessionDelegate: URLSessionDelegate {
+    public func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+      if let localCertPath = Bundle.main.url(forResource: "cert", withExtension: "p12"),
+         let localCertData = try?  Data(contentsOf: localCertPath)
+      {
+        let certificatePassword = "2475"
+        let identityAndTrust:IdentityAndTrust = extractIdentity(certData: localCertData as NSData, certPassword: certificatePassword)!
+        
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodClientCertificate {
+          
+            let urlCredential: URLCredential = URLCredential(PKCS12: PKCS12(PKCS12Data: localCertData as NSData, password: certificatePassword))!
+          completionHandler(URLSession.AuthChallengeDisposition.useCredential, urlCredential);
+          
+          return
+        }
+          
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust {
+            let urlCredential: URLCredential = URLCredential(PKCS12: PKCS12(PKCS12Data: localCertData as NSData, password: certificatePassword))!
+          completionHandler(URLSession.AuthChallengeDisposition.useCredential, urlCredential);
+          return
+        }
+        completionHandler (URLSession.AuthChallengeDisposition.performDefaultHandling, Optional.none);
+        return
+      }
+      
+      challenge.sender?.cancel(challenge)
+      completionHandler(URLSession.AuthChallengeDisposition.rejectProtectionSpace, nil)
+    }
+    
     open func urlSession(_ session: URLSession, didBecomeInvalidWithError error: Error?) {
         eventMonitor?.urlSession(session, didBecomeInvalidWithError: error)
 
@@ -94,7 +255,7 @@ extension SessionDelegate: URLSessionTaskDelegate {
         case NSURLAuthenticationMethodHTTPBasic, NSURLAuthenticationMethodHTTPDigest, NSURLAuthenticationMethodNTLM,
              NSURLAuthenticationMethodNegotiate:
             evaluation = attemptCredentialAuthentication(for: challenge, belongingTo: task)
-        #if canImport(Security)
+        #if !(os(Linux) || os(Windows))
         case NSURLAuthenticationMethodServerTrust:
             evaluation = attemptServerTrustAuthentication(with: challenge)
         case NSURLAuthenticationMethodClientCertificate:
@@ -111,7 +272,7 @@ extension SessionDelegate: URLSessionTaskDelegate {
         completionHandler(evaluation.disposition, evaluation.credential)
     }
 
-    #if canImport(Security)
+    #if !(os(Linux) || os(Windows))
     /// Evaluates the server trust `URLAuthenticationChallenge` received.
     ///
     /// - Parameter challenge: The `URLAuthenticationChallenge`.
